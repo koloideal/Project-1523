@@ -4,7 +4,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 
 from app.database.requests import set_user
-from middlewares import BaseMiddleware
+from app.middlewares import BaseMiddleware
+
 
 from app.generators import generate
 from app.states import Work
