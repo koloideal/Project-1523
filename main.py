@@ -121,11 +121,15 @@ async def message_handler(msg: types.Message):
 
     cursor.execute("SELECT message FROM messages WHERE user_id = ?", (user_id,))
     history = cursor.fetchall()
+    
+    MAX_HISTORY = 15
     chat_history = []
-    for m in history:
+    
+    for m in history[-MAX_HISTORY:]:
         if m[0] and isinstance(m[0], str):
             chat_history.append({"role": "user", "content": m[0]})
 
+    chat_history.append({"role": "system", "content": "Напоминаю, что сюжет продолжается..."})
 
     cursor.execute("SELECT text FROM story LIMIT 1")
     story_data = cursor.fetchone()
@@ -144,7 +148,8 @@ async def message_handler(msg: types.Message):
     if correction:
         response_text = correction[0]
 
-    await msg.answer(response_text, parse_mode="Markdown")
+    await msg.answer(response_text, parse_mode="Markdown")  
+
 
 async def main():
     await dp.start_polling(bot)
