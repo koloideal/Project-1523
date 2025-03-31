@@ -24,11 +24,9 @@ from langchain_community.document_loaders import Docx2txtLoader
 from langgraph.graph import START, MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Устанавливаем ключ для Mistral
 os.environ["MISTRAL_API_KEY"] = "XSFzvyw9LNYEjKYPFYFhYCzerqjeAr7Y"
 llm = ChatMistralAI(model="mistral-small-latest")
 
-# Подключаемся к базе данных и создаём таблицы
 conn = sqlite3.connect("users_data.db")
 cursor = conn.cursor()
 cursor.execute("""
@@ -51,14 +49,12 @@ cursor.execute("""
 """)
 conn.commit()
 
-# Определяем FSM состояния
 class Reg(StatesGroup):
-    start = State()    # Начальное состояние: выбор действия
-    dialog = State()   # Игровой диалог (игра идёт)
-    cont = State()     # Продолжить игру
-    new = State()      # Новая игра (очистка истории)
+    start = State()
+    dialog = State()
+    cont = State()
+    new = State()
 
-# Клавиатуры
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="✨ Начать квест ✅")],
@@ -78,14 +74,12 @@ final_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Выбери действие после финала..."
 )
 
-# Инициализация бота и диспетчера
 BOT_TOKEN = '7602719591:AAER_dkEQXD9x0O4RNnya5nzWss3RAnPqGE'
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 logging.basicConfig(level=logging.INFO)
 
-# Загрузка сюжета и создание retriever
 loader = Docx2txtLoader("story.docx")
 data = loader.load()
 embeddings = MistralAIEmbeddings(model="mistral-embed")
@@ -114,7 +108,6 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Инициализация цепочек LangChain
 question_answer_chain = create_stuff_documents_chain(llm, prompt)
 rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
@@ -128,11 +121,9 @@ workflow.add_node("model", call_model)
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
-# Функция для разделения длинного текста
 def split_text(text, chunk_size=4096):
     return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 
 @dp.message(CommandStart())
 async def start_command(message: Message, state: FSMContext):
@@ -186,19 +177,16 @@ async def handle_dialog(message: Message, state: FSMContext):
     row = cursor.fetchone()
     current_progress = row[0] if row else 1
 
-    # Если достигнут финал (progress >= 15)
     if current_progress >= 15:
         await generate_final_message(message, state, user_id)
         return
         
-    # Обновляем статистику решений
     cursor.execute("""
         INSERT OR IGNORE INTO user_stats (user_id) VALUES (?);
         UPDATE user_stats SET total_decisions = total_decisions + 1 WHERE user_id = ?;
     """, (user_id, user_id))
     conn.commit()
     
-    # Оригинальная логика обработки диалога
     retrieved_docs = retriever.invoke(message.text)
     context = "\n".join([doc.page_content for doc in retrieved_docs])
     formatted_system_prompt = system_prompt.format(context=context)
@@ -216,7 +204,6 @@ async def handle_dialog(message: Message, state: FSMContext):
     results = app.invoke({"messages": messages_chain}, config)
     bot_response = results["messages"][-1].content
     
-    # Проверяем на наличие "смерти" в ответе
     if any(word in bot_response.lower() for word in ["погиб", "умер", "смерть"]):
         cursor.execute("UPDATE user_stats SET deaths = deaths + 1 WHERE user_id = ?", (user_id,))
         conn.commit()
@@ -225,13 +212,11 @@ async def handle_dialog(message: Message, state: FSMContext):
     conn.commit()
     await message.answer(bot_response)
 
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ФИНАЛА И СТАТИСТИКИ ==========
 
 async def generate_final_message(message: Message, state: FSMContext, user_id: int):
     cursor.execute("SELECT story FROM user_progress WHERE user_id = ?", (user_id,))
     story = cursor.fetchone()[0]
     
-    # Генерируем персонализированный финал
     final_prompt = (
         f"Игрок завершил историю со следующими ключевыми моментами:\n{story}\n"
         "Сгенерируй эпичный финал с учётом выбранного пути. "
@@ -243,7 +228,6 @@ async def generate_final_message(message: Message, state: FSMContext, user_id: i
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=final_prompt)])
     final_text = response.content
     
-    # Обновляем статистику концовок
     cursor.execute("""
         UPDATE user_stats 
         SET endings_unlocked = endings_unlocked + 1, 
@@ -252,7 +236,6 @@ async def generate_final_message(message: Message, state: FSMContext, user_id: i
     """, (user_id,))
     conn.commit()
     
-    # Форматируем красивое сообщение
     final_message = (
         f"🎭 *ФИНАЛЬНАЯ СЦЕНА* 🎭\n\n"
         f"{final_text}\n\n"
@@ -264,11 +247,10 @@ async def generate_final_message(message: Message, state: FSMContext, user_id: i
     await message.answer(final_message, reply_markup=final_keyboard, parse_mode="Markdown")
     await state.set_state(Reg.start)
     
-    # Запланировать "новую угрозу" через 24 часа
     asyncio.create_task(schedule_threat_notification(user_id))
 
 async def schedule_threat_notification(user_id: int):
-    await asyncio.sleep(86400)  # 24 часа
+    await asyncio.sleep(86400)
     try:
         cursor.execute("SELECT threat_scheduled FROM user_stats WHERE user_id = ?", (user_id,))
         if cursor.fetchone()[0] == 0:
@@ -285,7 +267,6 @@ async def schedule_threat_notification(user_id: int):
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление: {e}")
 
-# ========== ОБРАБОТЧИКИ ДЛЯ НОВЫХ КНОПОК ==========
 
 @dp.message(lambda message: message.text == "📊 Показать статистику")
 async def show_stats(message: Message):
