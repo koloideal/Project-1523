@@ -3,15 +3,16 @@ import logging
 import sqlite3
 import time
 import os
+import re
+import httpx
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardRemove
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-import requests
 from mistralai import Mistral
 from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -25,7 +26,35 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, SystemMessage
 
 os.environ["MISTRAL_API_KEY"] = "XSFzvyw9LNYEjKYPFYFhYCzerqjeAr7Y"
-llm = ChatMistralAI(model="mistral-small-latest")
+BOT_TOKEN = '7602719591:AAER_dkEQXD9x0O4RNnya5nzWss3RAnPqGE'
+RATE_LIMIT_DELAY = 3.0
+MAX_RETRIES = 3
+
+class SafeMistralAI(ChatMistralAI):
+    _timestamps = {}
+    
+    async def safe_invoke(self, messages, retries=MAX_RETRIES):
+        model_id = f"{self.model}-{id(self)}"
+        if model_id in self._timestamps:
+            elapsed = (datetime.now() - self._timestamps[model_id]).total_seconds()
+            if elapsed < RATE_LIMIT_DELAY:
+                await asyncio.sleep(RATE_LIMIT_DELAY - elapsed)
+        
+        try:
+            self._timestamps[model_id] = datetime.now()
+            return self.invoke(messages)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and retries > 0:
+                wait_time = 5 * (MAX_RETRIES - retries + 1)
+                logging.warning(f"Rate limit exceeded. Waiting {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+                return await self.safe_invoke(messages, retries - 1)
+            raise
+        except Exception as e:
+            logging.error(f"Error in Mistral API: {str(e)}")
+            raise
+
+llm = SafeMistralAI(model="mistral-small-latest")
 
 conn = sqlite3.connect("users_data.db")
 cursor = conn.cursor()
@@ -34,17 +63,8 @@ cursor.execute("""
         user_id INTEGER PRIMARY KEY,
         progress INTEGER DEFAULT 0,
         story TEXT DEFAULT '',
-        thread_id TEXT DEFAULT ''
-    )
-""")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS user_stats (
-        user_id INTEGER PRIMARY KEY,
-        total_decisions INTEGER DEFAULT 0,
-        deaths INTEGER DEFAULT 0,
-        endings_unlocked INTEGER DEFAULT 0,
-        last_played TEXT DEFAULT '',
-        threat_scheduled INTEGER DEFAULT 0
+        thread_id TEXT DEFAULT '',
+        options TEXT DEFAULT '[]'
     )
 """)
 conn.commit()
@@ -52,6 +72,7 @@ conn.commit()
 class Reg(StatesGroup):
     start = State()
     dialog = State()
+    custom_choice = State()
     cont = State()
     new = State()
 
@@ -65,16 +86,17 @@ start_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="🎮 Выбери действие..."
 )
 
-final_keyboard = ReplyKeyboardMarkup(
+options_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔄 Начать новую игру"), KeyboardButton(text="📊 Показать статистику")],
-        [KeyboardButton(text="💀 Смертельные сценарии"), KeyboardButton(text="🌟 Секретные концовки")]
+        [KeyboardButton(text="1-ый вариант")],
+        [KeyboardButton(text="2-ой вариант")],
+        [KeyboardButton(text="3-ий вариант")],
+        [KeyboardButton(text="🎭 Другой вариант")]
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выбери действие после финала..."
+    input_field_placeholder="🎲 Выбери вариант..."
 )
 
-BOT_TOKEN = '7602719591:AAER_dkEQXD9x0O4RNnya5nzWss3RAnPqGE'
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -112,18 +134,28 @@ question_answer_chain = create_stuff_documents_chain(llm, prompt)
 rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
 workflow = StateGraph(state_schema=MessagesState)
+
 def call_model(state: MessagesState):
     response = llm.invoke(state["messages"])
     return {"messages": response}
-workflow.add_edge(START, "model")
+
 workflow.add_node("model", call_model)
+workflow.add_edge(START, "model")
 
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
-def split_text(text, chunk_size=4096):
-    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-
+def parse_response(text: str) -> tuple[str, list[str]]:
+    parts = re.split(r"Какое действие ты сделаешь\??", text, flags=re.IGNORECASE)
+    main_text = parts[0].strip()
+    options = []
+    
+    if len(parts) > 1:
+        options_block = parts[1]
+        option_matches = re.findall(r"\d+\.\s*(.*)", options_block)
+        options = [match.strip() for match in option_matches[:3]]
+    
+    return main_text, options
 
 @dp.message(CommandStart())
 async def start_command(message: Message, state: FSMContext):
@@ -145,8 +177,7 @@ async def start_story(message: Message, state: FSMContext):
         new_thread_id = f"{message.chat.id}_{int(time.time())}"
         await state.update_data(thread_id=new_thread_id)
         cursor.execute("INSERT INTO user_progress (user_id, progress, story, thread_id) VALUES (?, 1, '', ?)",
-                      (user_id, new_thread_id))
-        cursor.execute("INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (user_id,))
+                       (user_id, new_thread_id))
         conn.commit()
         await state.set_state(Reg.dialog)
         await handle_dialog(message, state)
@@ -159,7 +190,7 @@ async def start_story(message: Message, state: FSMContext):
             await state.set_state(Reg.start)
         else:
             await state.update_data(thread_id=row[0], progress=row[1], story=row[2])
-            await message.answer("📜 Сохранённая история загружена. Продолжайте игру, напишите новое сообщение.")
+            await message.answer("📜 Сохранённая история загружена. Выберите действие:", reply_markup=options_keyboard)
             await state.set_state(Reg.dialog)
             
     elif message.text == "🔄 Новая игра 🌍":
@@ -172,169 +203,91 @@ async def start_story(message: Message, state: FSMContext):
 async def handle_dialog(message: Message, state: FSMContext):
     user_id = message.from_user.id
     data = await state.get_data()
+    current_options = data.get("current_options", [])
     
-    cursor.execute("SELECT progress FROM user_progress WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    current_progress = row[0] if row else 1
-
-    if current_progress >= 15:
-        await generate_final_message(message, state, user_id)
+    if message.text in ["1-ый вариант", "2-ой вариант", "3-ий вариант"]:
+        option_index = int(message.text[0]) - 1
+        if 0 <= option_index < len(current_options):
+            user_input = current_options[option_index]
+        else:
+            await message.answer("❌ Выберите вариант из списка", reply_markup=options_keyboard)
+            return
+    elif message.text == "🎭 Другой вариант":
+        await message.answer("✍️ Напишите свой вариант действия:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(Reg.custom_choice)
         return
-        
-    cursor.execute("""
-        INSERT OR IGNORE INTO user_stats (user_id) VALUES (?);
-        UPDATE user_stats SET total_decisions = total_decisions + 1 WHERE user_id = ?;
-    """, (user_id, user_id))
-    conn.commit()
-    
-    retrieved_docs = retriever.invoke(message.text)
-    context = "\n".join([doc.page_content for doc in retrieved_docs])
-    formatted_system_prompt = system_prompt.format(context=context)
-    
-    messages_chain = [
-        SystemMessage(content=formatted_system_prompt),
-        HumanMessage(content=message.text)
-    ] if current_progress == 1 else [HumanMessage(content=message.text)]
-    
-    new_progress = current_progress + 1
-    cursor.execute("UPDATE user_progress SET progress = ? WHERE user_id = ?", (new_progress, user_id))
-    conn.commit()
-    
-    config = {"configurable": {"thread_id": data.get("thread_id", str(message.chat.id))}}
-    results = app.invoke({"messages": messages_chain}, config)
-    bot_response = results["messages"][-1].content
-    
-    if any(word in bot_response.lower() for word in ["погиб", "умер", "смерть"]):
-        cursor.execute("UPDATE user_stats SET deaths = deaths + 1 WHERE user_id = ?", (user_id,))
-        conn.commit()
-    
-    cursor.execute("UPDATE user_progress SET story = ? WHERE user_id = ?", (bot_response, user_id))
-    conn.commit()
-    await message.answer(bot_response)
-
-
-async def generate_final_message(message: Message, state: FSMContext, user_id: int):
-    cursor.execute("SELECT story FROM user_progress WHERE user_id = ?", (user_id,))
-    story = cursor.fetchone()[0]
-    
-    final_prompt = (
-        f"Игрок завершил историю со следующими ключевыми моментами:\n{story}\n"
-        "Сгенерируй эпичный финал с учётом выбранного пути. "
-        "Упомяни 2-3 главных решения игрока. "
-        "Добавь философское заключение о последствиях выбора. "
-        "В конце добавь секретное пророчество о возможном будущем (1 предложение)."
-    )
-    
-    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=final_prompt)])
-    final_text = response.content
-    
-    cursor.execute("""
-        UPDATE user_stats 
-        SET endings_unlocked = endings_unlocked + 1, 
-            last_played = datetime('now')
-        WHERE user_id = ?
-    """, (user_id,))
-    conn.commit()
-    
-    final_message = (
-        f"🎭 *ФИНАЛЬНАЯ СЦЕНА* 🎭\n\n"
-        f"{final_text}\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "Ты достиг конца этой истории, но мир Crystals of Fate продолжает жить...\n"
-        "Что ты хочешь сделать дальше?"
-    )
-    
-    await message.answer(final_message, reply_markup=final_keyboard, parse_mode="Markdown")
-    await state.set_state(Reg.start)
-    
-    asyncio.create_task(schedule_threat_notification(user_id))
-
-async def schedule_threat_notification(user_id: int):
-    await asyncio.sleep(86400)
-    try:
-        cursor.execute("SELECT threat_scheduled FROM user_stats WHERE user_id = ?", (user_id,))
-        if cursor.fetchone()[0] == 0:
-            await bot.send_message(
-                user_id,
-                "🌑 *Тревожное предупреждение*\n\n"
-                "Прошло ровно 24 часа с момента завершения твоего квеста...\n"
-                "В Бездне пробудилось нечто древнее. Кристалл Судьбы снова зовет тебя!\n\n"
-                "Напиши /start чтобы начать новое приключение!",
-                parse_mode="Markdown"
-            )
-            cursor.execute("UPDATE user_stats SET threat_scheduled = 1 WHERE user_id = ?", (user_id,))
-            conn.commit()
-    except Exception as e:
-        logging.error(f"Не удалось отправить уведомление: {e}")
-
-
-@dp.message(lambda message: message.text == "📊 Показать статистику")
-async def show_stats(message: Message):
-    user_id = message.from_user.id
-    cursor.execute("""
-        SELECT us.total_decisions, us.deaths, us.endings_unlocked, 
-               up.progress, up.story
-        FROM user_stats us
-        LEFT JOIN user_progress up ON us.user_id = up.user_id
-        WHERE us.user_id = ?
-    """, (user_id,))
-    stats = cursor.fetchone()
-    
-    if stats and stats[0] is not None:
-        total_decisions, deaths, endings, progress, story = stats
-        decisions_in_story = story.count("1.") + story.count("2.") + story.count("3.") if story else 0
-        
-        response = (
-            f"📜 *Твоя статистика в Crystals of Fate*:\n\n"
-            f"• Всего решений: {total_decisions + decisions_in_story}\n"
-            f"• Смертельных исходов: {deaths}\n"
-            f"• Открыто концовок: {endings}\n"
-            f"• Макс. прогресс: {progress if progress else 0}\n\n"
-            f"🔮 *Текущая история*:\n{story[:300]}..." if story else ""
-        )
     else:
-        response = "У тебя пока нет статистики. Пройди квест хотя бы один раз!"
+        cursor.execute("SELECT progress FROM user_progress WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row and row[0] == 1:
+            user_input = "Начать игру"
+        else:
+            await message.answer("ℹ️ Используйте кнопки для выбора", reply_markup=options_keyboard)
+            return
     
-    await message.answer(response, parse_mode="Markdown")
+    await process_user_choice(user_input, message, state)
 
-@dp.message(lambda message: message.text == "💀 Смертельные сценарии")
-async def show_deaths(message: Message):
-    user_id = message.from_user.id
-    cursor.execute("SELECT deaths FROM user_stats WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    deaths = result[0] if result else 0
-    
-    death_messages = [
-        "Ты ещё не знаешь вкус поражения...",
-        "1 смерть - это только начало",
-        f"{deaths} раз ты смотрел в бездну...",
-        "Мастер смерти! Ты умер {deaths} раз!"
-    ]
-    
-    msg = death_messages[min(deaths, 3)].format(deaths=deaths)
-    await message.answer(msg)
+@dp.message(Reg.custom_choice)
+async def handle_custom_choice(message: Message, state: FSMContext):
+    await process_user_choice(message.text, message, state)
+    await state.set_state(Reg.dialog)
 
-@dp.message(lambda message: message.text == "🔄 Начать новую игру")
-async def new_game_with_threat(message: Message, state: FSMContext):
+async def process_user_choice(user_input: str, message: Message, state: FSMContext):
     user_id = message.from_user.id
-    cursor.execute("DELETE FROM user_progress WHERE user_id = ?", (user_id,))
-    cursor.execute("""
-        UPDATE user_stats 
-        SET last_played = datetime('now'), 
-            threat_scheduled = 0
-        WHERE user_id = ?
-    """, (user_id,))
-    conn.commit()
+    data = await state.get_data()
     
-    await message.answer(
-        "🌌 *Новая игра началась!*\n\n"
-        "Но помни - в этом мире ничто не исчезает бесследно...\n"
-        "Твои прошлые решения могут повлиять на новую реальность!\n\n"
-        "Через 24 часа тебя ждёт сюрприз...",
-        reply_markup=start_keyboard,
-        parse_mode="Markdown"
-    )
-    await state.set_state(Reg.start)
+    try:
+        retrieved_docs = retriever.invoke(user_input)
+        context = "\n".join([doc.page_content for doc in retrieved_docs])
+        
+        cursor.execute("SELECT progress FROM user_progress WHERE user_id = ?", (user_id,))
+        progress = cursor.fetchone()[0] + 1
+        
+        messages = [
+            SystemMessage(content=system_prompt.format(context=context)),
+            HumanMessage(content=user_input)
+        ] if progress == 1 else [HumanMessage(content=user_input)]
+        
+        config = {"configurable": {"thread_id": data["thread_id"], "progress": progress}}
+        
+        await asyncio.sleep(RATE_LIMIT_DELAY)
+        
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: app.invoke({"messages": messages}, config)
+        )
+        
+        bot_response = results["messages"][-1].content
+        
+        main_text, options = parse_response(bot_response)
+        
+        await state.update_data(
+            story=bot_response,
+            current_options=options,
+            progress=progress
+        )
+        
+        cursor.execute(
+            "UPDATE user_progress SET story = ?, options = ?, progress = ? WHERE user_id = ?",
+            (bot_response, str(options), progress, user_id)
+        )
+        conn.commit()
+        
+        if progress >= 15:
+            await message.answer(main_text, reply_markup=start_keyboard)
+            await state.set_state(Reg.start)
+        else:
+            await message.answer(main_text)
+            if options:
+                await message.answer("🎲 Выберите действие:", reply_markup=options_keyboard)
+            else:
+                await message.answer("➡️ Продолжайте...", reply_markup=ReplyKeyboardRemove())
+                
+    except Exception as e:
+        logging.error(f"Error in process_user_choice: {str(e)}")
+        await message.answer("⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.", reply_markup=start_keyboard)
+        await state.set_state(Reg.start)
 
 @dp.message(Reg.cont)
 async def handle_continue(message: Message, state: FSMContext):
@@ -346,9 +299,8 @@ async def handle_continue(message: Message, state: FSMContext):
         await state.set_state(Reg.start)
     else:
         await state.update_data(thread_id=row[0], progress=row[1], story=row[2])
-        await message.answer(f"📜 Ваша сохранённая история:\n{row[2]}\n\nПродолжайте игру!")
+        await message.answer(f"📜 Ваша сохранённая история:\n{row[2]}\n\nВыберите действие:", reply_markup=options_keyboard)
         await state.set_state(Reg.dialog)
-        await handle_dialog(message, state)
 
 async def main():
     logging.info("Starting bot...")
